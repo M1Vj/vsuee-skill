@@ -55,7 +55,8 @@ test('encryptCredential and decryptCredential edge cases', () => {
   const tamperedTag = `${parts[0]}:00000000000000000000000000000000:${parts[2]}`;
   assert.equal(decryptCredential(tamperedTag), null);
 
-  const tamperedData = `${parts[0]}:${parts[1]}:ff${parts[2].slice(2)}`;
+  const replacementByte = parts[2].startsWith('ff') ? '00' : 'ff';
+  const tamperedData = `${parts[0]}:${parts[1]}:${replacementByte}${parts[2].slice(2)}`;
   assert.equal(decryptCredential(tamperedData), null);
 });
 

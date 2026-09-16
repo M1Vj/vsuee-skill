@@ -27,3 +27,6 @@ coverage/
 test_tmp*
 test_live_*
 tmp/
+
+# Temporary Filesystem
+.output/*

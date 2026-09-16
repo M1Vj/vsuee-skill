@@ -1,6 +1,6 @@
 {
   "name": "vsuee-skill",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "High-speed CLI toolkit and AI agent skill for the Visayas State University E-Learning Environment (VSUEE Moodle).",
   "keywords": [
     "vsuee",
@@ -37,16 +37,27 @@
     "skills",
     "plugin.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "package.json"
   ],
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
     "test": "npm run test:unit",
-    "test:unit": "node --test test/moodle-client.test.mjs test/moodle-client-downloads.test.mjs test/session-auth.test.mjs test/sync-manager.test.mjs test/browser-runner.test.mjs",
+    "test:unit": "node --test test/moodle-client.test.mjs test/moodle-client-downloads.test.mjs test/session-auth.test.mjs test/sync-manager.test.mjs test/browser-runner.test.mjs test/release-workflow.test.mjs",
     "test:all": "node --test test/*.test.mjs",
-    "test:live": "VSUEE_LIVE_TEST=1 node --test test/integration.test.mjs"
+    "test:live": "VSUEE_LIVE_TEST=1 node --test test/integration.test.mjs",
+    "test:release:package-content": "node test/release-package-content.mjs .tmp/build/release/dist/vsuee-skill.tgz",
+    "test:release:local-installation": "node test/local-installation.mjs .tmp/build/release/dist/vsuee-skill.tgz",
+    "test:release:workflow": "node --test test/release-workflow.test.mjs",
+    "tmp:cleanup": "node scripts/remove-filesystem-path.mjs .tmp",
+    "tmp:setup": "node scripts/setup-filesystem-tree.mjs .tmp/build/release/package .tmp/build/release/dist",
+    "build:release:package": "node scripts/copy-filesystem-path.mjs .tmp/build/release/package package.json LICENSE plugin.json README.md bin lib skills",
+    "build:release:dist": "node scripts/npm-pack-tarball.mjs .tmp/build/release/package .tmp/build/release/dist",
+    "rename:release:dist": "node scripts/rename-filesystem-path.mjs .tmp/build/release/dist \"*.tgz\" vsuee-skill.tgz",
+    "deploy:staged:npm:release": "npm stage publish .tmp/build/release/dist/vsuee-skill.tgz",
+    "workflow:stage-release": "node scripts/run-scripts.mjs tmp:cleanup tmp:setup build:release:package build:release:dist rename:release:dist test:release:package-content test:release:local-installation"
   },
   "peerDependencies": {
     "playwright": "^1.40.0"
