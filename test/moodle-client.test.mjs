@@ -399,3 +399,119 @@ test('MoodleClient submitAssignment end-to-end mock flow', async () => {
     if (fsSync.existsSync(testFile)) fsSync.unlinkSync(testFile);
   }
 });
+
+// Snapshot consumers require complete collections; ordinary listing remains best-effort.
+for (const [method, payload] of [
+  ['getCourses', { courses: [] }],
+  ['getTimeline', { events: [] }],
+]) {
+  const read = (client, strict) => method === 'getCourses'
+    ? client.getCourses({ strict })
+    : client.getTimeline(30, { strict });
+
+  test(`${method} strict accepts an authoritative empty AJAX collection without HTML fallback`, async () => {
+    const client = new MoodleClient();
+    client.callAjax = async () => payload;
+    let fallbackCalls = 0;
+    client.fetchWithAuth = async () => {
+      fallbackCalls++;
+      return { ok: true, text: async () => '<html></html>' };
+    };
+    assert.deepEqual(await read(client, true), []);
+    assert.equal(fallbackCalls, 0);
+    // Preserve the historical fallback for existing non-strict callers.
+    assert.deepEqual(await read(client, false), []);
+    assert.equal(fallbackCalls, 1);
+  });
+
+  test(`${method} strict rejects an unsuccessful HTML fallback rather than returning empty`, async () => {
+    const client = new MoodleClient();
+    for (const ajaxResult of [null, { unexpected: [] }]) {
+      client.callAjax = async () => ajaxResult;
+      client.fetchWithAuth = async () => ({ ok: false, status: 503, text: async () => '' });
+      await assert.rejects(read(client, true), /Unable to fetch/);
+      assert.deepEqual(await read(client, false), []);
+    }
+    client.callAjax = async () => { throw new Error('synthetic AJAX failure'); };
+    await assert.rejects(read(client, true), /Unable to fetch/);
+  });
+
+  test(`${method} strict still permits a successful empty HTML fallback`, async () => {
+    const client = new MoodleClient();
+    client.callAjax = async () => { throw new Error('synthetic AJAX unavailable'); };
+    client.fetchWithAuth = async () => ({ ok: true, text: async () => '<html><body>No items</body></html>' });
+    assert.deepEqual(await read(client, true), []);
+  });
+}
+
+test('strict collections reject recognized logged-out HTML, not an empty collection', async () => {
+  const client = new MoodleClient();
+  client.callAjax = async () => { throw new Error('synthetic AJAX unavailable'); };
+  for (const html of [
+    '<form><input name="logintoken" value="synthetic-placeholder"></form>',
+    '<a href="/login/index.php">Login</a>You are not logged in',
+  ]) {
+    client.fetchWithAuth = async () => ({ ok: true, text: async () => html });
+    await assert.rejects(client.getCourses({ strict: true }), /Session expired/);
+    await assert.rejects(client.getTimeline(30, { strict: true }), /Session expired/);
+    await assert.rejects(client.getAssignments(10, { strict: true }), /Session expired/);
+    assert.deepEqual(await client.getAssignments(10), []);
+  }
+});
+
+const snapshotAssignmentHtml = '<table><tr class="assignment"><td>Topic</td><td><a href="https://elearning.vsu.edu.ph/mod/assign/view.php?id=51">Synthetic assignment</a></td><td>Tomorrow</td><td>No attempt</td><td>No grade</td></tr></table>';
+
+test('getAssignments strict rejects a partial collection after one course succeeds', async () => {
+  const client = new MoodleClient();
+  const optionsSeen = [];
+  client.getCourses = async options => {
+    optionsSeen.push(options);
+    return [{ id: 10, fullname: 'Synthetic 10' }, { id: 20, fullname: 'Synthetic 20' }];
+  };
+  for (const failure of ['http', 'network', 'body']) {
+    client.fetchWithAuth = async url => {
+      if (url.endsWith('id=10')) return { ok: true, text: async () => snapshotAssignmentHtml };
+      if (failure === 'network') throw new Error('synthetic network failure');
+      if (failure === 'body') return { ok: true, text: async () => { throw new Error('synthetic body failure'); } };
+      return { ok: false, status: 503, text: async () => '' };
+    };
+    await assert.rejects(client.getAssignments(null, { strict: true }), /Unable to fetch all assignments/);
+    const partial = await client.getAssignments();
+    assert.deepEqual(partial.map(a => a.id), [51]);
+    assert.equal(partial[0].coursename, 'Synthetic 10');
+  }
+  assert.deepEqual(optionsSeen.filter(options => options.strict), [
+    { strict: true }, { strict: true }, { strict: true },
+  ]);
+});
+
+test('getAssignments strict distinguishes a failed course from successful empty courses', async () => {
+  const client = new MoodleClient();
+  client.fetchWithAuth = async () => ({ ok: false, status: 403, text: async () => '' });
+  await assert.rejects(client.getAssignments(10, { strict: true }), /Unable to fetch assignments/);
+  assert.deepEqual(await client.getAssignments(10), []);
+  client.getCourses = async () => [{ id: 10, fullname: 'Synthetic 10' }, { id: 20, fullname: 'Synthetic 20' }];
+  client.fetchWithAuth = async url => ({ ok: true, text: async () => url.endsWith('id=10') ? snapshotAssignmentHtml : '<table></table>' });
+  assert.deepEqual((await client.getAssignments(null, { strict: true })).map(a => a.id), [51]);
+  assert.deepEqual(await client.getAssignments(20, { strict: true }), []);
+  client.fetchWithAuth = async () => ({ ok: true, text: async () => '<table></table>' });
+  assert.deepEqual(await client.getAssignments(null, { strict: true }), []);
+});
+
+test('strict assignment catalog failure cannot masquerade as zero enrolled courses', async () => {
+  const client = new MoodleClient();
+  client.callAjax = async () => { throw new Error('synthetic AJAX unavailable'); };
+  client.fetchWithAuth = async () => ({ ok: false, status: 503, text: async () => '' });
+  await assert.rejects(client.getAssignments(null, { strict: true }), /Unable to fetch the course catalog/);
+  assert.deepEqual(await client.getAssignments(), []);
+});
+
+test('strict AJAX reads retain nonempty course and timeline normalization', async () => {
+  const client = new MoodleClient();
+  client.callAjax = async method => method.includes('course_get')
+    ? { courses: [{ id: 10, fullname: 'Synthetic 10', hidden: true }] }
+    : { events: [{ id: 71, name: 'Synthetic deadline', course: { id: 10, fullname: 'Synthetic 10' }, action: { url: 'https://synthetic.invalid/event' } }] };
+  client.fetchWithAuth = async () => assert.fail('Nonempty AJAX results must not use fallback');
+  assert.deepEqual(await client.getCourses({ strict: true }), await client.getCourses());
+  assert.deepEqual(await client.getTimeline(30, { strict: true }), await client.getTimeline(30));
+});
