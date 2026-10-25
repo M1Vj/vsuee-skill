@@ -510,3 +510,59 @@ test('SyncManager notifySystem handles special characters safely without throwin
   });
 });
 
+
+const manager = new SyncManager();
+const event = {
+  id: 101, name: 'Quiz window', coursename: 'Synthetic course', courseid: 42,
+  timestart: 1792922400, formattedtime: 'Tomorrow, 10:00',
+  actionurl: 'https://example.invalid/mod/quiz/view.php?id=101',
+};
+const snapshot = timeline => ({ timestamp: '2026-10-25T09:00:00Z', courses: [], assignments: [], timeline });
+
+for (const context of ['sync', 'diff', 'watch']) {
+  test(`timeline-only reschedule is actionable in ${context} report`, () => {
+    const diff = manager.diffSnapshots(snapshot([event]), snapshot([{ ...event,
+      timestart: 1792915200, formattedtime: 'Tomorrow, 08:00',
+    }]));
+    assert.equal(diff.totalChangeCount, 1);
+    assert.equal(diff.hasChanges, true);
+    const report = manager.formatDiffReport(diff, { context });
+    assert.match(report, /Quiz window \[Synthetic course\]/);
+    assert.match(report, /WAS: Tomorrow, 10:00/);
+    assert.match(report, /NOW: Tomorrow, 08:00/);
+    assert.ok(report.includes(event.actionurl));
+  });
+}
+
+test('timeline reschedule report supports timestamp fallback and missing optional metadata', () => {
+  const oldEvent = { id: 102, name: 'Calendar event', timestart: 1000 };
+  const diff = manager.diffSnapshots(snapshot([oldEvent]), snapshot([{ ...oldEvent, timestart: 2000 }]));
+  const report = manager.formatDiffReport(diff);
+  assert.match(report, /Calendar event/);
+  assert.match(report, /WAS: 1000/);
+  assert.match(report, /NOW: 2000/);
+  assert.doesNotMatch(report, /undefined|URL:/);
+});
+
+test('unchanged timeline does not emit reschedule section', () => {
+  const diff = manager.diffSnapshots(snapshot([event]), snapshot([{ ...event }]));
+  assert.equal(diff.hasChanges, false);
+  assert.doesNotMatch(manager.formatDiffReport(diff), /CALENDAR EVENT.*CHANGES/);
+});
+
+test('legacy diff objects without timelineChanged still format', () => {
+  const diff = manager.diffSnapshots(snapshot([]), snapshot([event]));
+  delete diff.changes.timelineChanged;
+  assert.match(manager.formatDiffReport(diff), /Quiz window/);
+});
+
+for (const missingTime of [null, undefined]) {
+  test(`timeline report labels ${missingTime} times as unknown`, () => {
+    const diff = manager.diffSnapshots(snapshot([event]), snapshot([{ ...event, timestart: 0, formattedtime: missingTime }]));
+    diff.changes.timelineChanged[0].oldTime = missingTime;
+    const report = manager.formatDiffReport(diff);
+    assert.match(report, /WAS: Unknown/);
+    assert.match(report, /NOW: 0/);
+    assert.doesNotMatch(report, /WAS: null|WAS: undefined/);
+  });
+}
