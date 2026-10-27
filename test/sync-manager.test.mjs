@@ -592,3 +592,186 @@ test('SyncManager notifySystem handles special characters safely without throwin
   });
 });
 
+
+function collectionBaseline() {
+  return {
+    version: 1,
+    timestamp: '2026-09-01T00:00:00Z',
+    user: { id: 1, fullname: 'Synthetic student' },
+    courseCount: 2,
+    totalModules: 0,
+    courses: [10, 20].map(id => ({ id, fullname: `Synthetic ${id}`, sections: [] })),
+    assignments: [10, 20].map((courseid, i) => ({
+      id: 51 + i, courseid, name: `Synthetic assignment ${i}`, duedate: 'Tomorrow',
+      submissionStatus: 'No attempt', grade: 'No grade',
+    })),
+    timeline: [{ id: 71, courseid: 10, name: 'Synthetic deadline', formattedtime: 'Tomorrow' }],
+  };
+}
+
+function collectionClient(base = collectionBaseline()) {
+  return {
+    baseUrl: 'https://synthetic.invalid',
+    checkStatus: async () => ({ authenticated: true, user: base.user }),
+    getCourses: async () => base.courses,
+    getCourseContents: async id => ({ title: `Synthetic ${id}`, sections: [] }),
+    getAssignments: async () => [],
+    getTimeline: async () => [],
+  };
+}
+
+async function withCollectionManager(run) {
+  const snapshotsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vsuee_collections_'));
+  try {
+    await run(new SyncManager({ snapshotsDir }));
+  } finally {
+    await fs.rm(snapshotsDir, { recursive: true, force: true });
+  }
+}
+
+for (const courseId of [null, 10]) {
+  for (const collection of ['assignments', 'timeline']) {
+    test(`buildSnapshot ${courseId ? 'single-course' : 'full'} ${collection} failure leaves saved snapshots and freshness unchanged`, async () => {
+      await withCollectionManager(async sm => {
+        const base = collectionBaseline();
+        await sm.saveSnapshot({ ...base, timestamp: '2026-08-31T00:00:00Z' });
+        await sm.saveSnapshot(base);
+        const files = [sm.latestFile, sm.previousFile, sm.manifestFile];
+        const before = await Promise.all(files.map(file => fs.readFile(file, 'utf8')));
+        const client = collectionClient(base);
+        const method = collection === 'assignments' ? 'getAssignments' : 'getTimeline';
+        for (const failure of ['reject', 'invalid']) {
+          client[method] = async () => {
+            if (failure === 'reject') throw new Error('https://synthetic.invalid/?sesskey=synthetic-private-marker');
+            return null;
+          };
+          await assert.rejects(async () => {
+            const snapshot = await sm.buildSnapshot({ client, courseId });
+            await sm.saveSnapshot(snapshot);
+          }, err => {
+            assert.match(err.message, /Unable to fetch.*Snapshot not updated; please retry/);
+            assert.doesNotMatch(err.message, /synthetic-private-marker|sesskey|https:/);
+            return true;
+          });
+          assert.deepEqual(await Promise.all(files.map(file => fs.readFile(file, 'utf8'))), before);
+        }
+        assert.deepEqual(base, collectionBaseline());
+      });
+    });
+  }
+
+  test(`buildSnapshot ${courseId ? 'single-course' : 'full'} successful empty collections clear only the intended assignments and all timeline data`, async () => {
+    await withCollectionManager(async sm => {
+      const base = collectionBaseline();
+      const snapshot = await sm.buildSnapshot({ client: collectionClient(base), baseSnapshot: base, courseId });
+      assert.deepEqual(snapshot.assignments.map(a => a.id), courseId ? [52] : []);
+      assert.deepEqual(snapshot.timeline, []);
+      assert.deepEqual(sm.diffSnapshots(base, snapshot).changes.assignmentsRemoved.map(a => a.id), courseId ? [51] : [51, 52]);
+      assert.deepEqual(base, collectionBaseline());
+    });
+  });
+}
+
+test('buildSnapshot requests complete collections and preserves successful single-course merges', async () => {
+  await withCollectionManager(async sm => {
+    const base = collectionBaseline();
+    const client = collectionClient(base);
+    const calls = [];
+    client.getCourses = async options => { calls.push(['courses', options]); return base.courses; };
+    client.getAssignments = async (courseId, options) => {
+      calls.push(['assignments', courseId, options]);
+      return [{ ...base.assignments[0], grade: 'Synthetic updated grade' }];
+    };
+    client.getTimeline = async (limit, options) => {
+      calls.push(['timeline', limit, options]);
+      return [{ ...base.timeline[0], formattedtime: 'Later' }];
+    };
+    await sm.buildSnapshot({ client, baseSnapshot: base });
+    assert.deepEqual(calls, [
+      ['courses', { all: true, strict: true }],
+      ['assignments', null, { strict: true }],
+      ['timeline', 30, { strict: true }],
+    ]);
+    calls.length = 0;
+    const snapshot = await sm.buildSnapshot({ client, baseSnapshot: base, courseId: 10 });
+    assert.deepEqual(calls, [['assignments', 10, { strict: true }], ['timeline', 30, { strict: true }]]);
+    assert.deepEqual(snapshot.assignments.map(a => a.id), [52, 51]);
+    assert.equal(snapshot.timeline[0].formattedtime, 'Later');
+    assert.deepEqual(snapshot.courses.map(c => c.id), [10, 20]);
+  });
+});
+
+test('buildSnapshot catalog failure is sanitized and stops before assignments', async () => {
+  await withCollectionManager(async sm => {
+    const client = collectionClient();
+    client.getAssignments = async () => assert.fail('Assignments must not run after a failed catalog');
+    for (const failure of ['reject', 'invalid']) {
+      client.getCourses = async () => {
+        if (failure === 'reject') throw new Error('https://synthetic.invalid/?sesskey=synthetic-private-marker');
+        return null;
+      };
+      await assert.rejects(sm.buildSnapshot({ client }), err => {
+        assert.equal(err.message, 'Unable to fetch the course catalog. Snapshot not updated; please retry.');
+        return true;
+      });
+    }
+    assert.equal(await sm.getLatestSnapshot(), null);
+  });
+});
+
+test('buildSnapshot initial collection failure creates no baseline; later success recovers cleanly', async () => {
+  await withCollectionManager(async sm => {
+    const client = collectionClient();
+    client.getAssignments = async () => { throw new Error('synthetic unavailable'); };
+    await assert.rejects(async () => sm.saveSnapshot(await sm.buildSnapshot({ client })), /Snapshot not updated/);
+    assert.equal(await sm.getLatestSnapshot(), null);
+    client.getAssignments = async () => [];
+    const snapshot = await sm.buildSnapshot({ client });
+    assert.equal(sm.diffSnapshots(null, snapshot).isInitial, true);
+    await sm.saveSnapshot(snapshot);
+    assert.deepEqual((await sm.getLatestSnapshot()).assignments, []);
+    assert.deepEqual((await sm.getLatestSnapshot()).timeline, []);
+  });
+});
+
+
+test('buildSnapshot rejects real client partial assignments and recovers without false removals', async () => {
+  await withCollectionManager(async sm => {
+    const base = collectionBaseline();
+    await sm.saveSnapshot(base);
+    const before = await fs.readFile(sm.latestFile, 'utf8');
+    const client = new MoodleClient({ baseUrl: 'https://synthetic.invalid' });
+    client.checkStatus = async () => ({ authenticated: true, user: base.user });
+    client.getCourses = async () => base.courses;
+    client.getCourseContents = async id => ({ title: `Synthetic ${id}`, sections: [] });
+    client.getTimeline = async () => [];
+    let unavailable = true;
+    client.fetchWithAuth = async url => {
+      const courseId = Number(new URL(url).searchParams.get('id'));
+      if (unavailable && courseId === 20) return { ok: false, status: 503, text: async () => '' };
+      const id = courseId === 10 ? 51 : 52;
+      return { ok: true, text: async () => `<tr class="assignment"><td>Topic</td><td><a href="https://elearning.vsu.edu.ph/mod/assign/view.php?id=${id}">Synthetic assignment</a></td><td>Tomorrow</td><td>No attempt</td><td>No grade</td></tr>` };
+    };
+    await assert.rejects(async () => sm.saveSnapshot(await sm.buildSnapshot({ client })), /Unable to fetch all assignments/);
+    assert.equal(await fs.readFile(sm.latestFile, 'utf8'), before);
+    unavailable = false;
+    const snapshot = await sm.buildSnapshot({ client });
+    assert.deepEqual(snapshot.assignments.map(a => a.id), [51, 52]);
+    assert.deepEqual(sm.diffSnapshots(base, snapshot).changes.assignmentsRemoved, []);
+  });
+});
+
+test('failed collection fetch does not relabel an existing snapshot under another account', async () => {
+  await withCollectionManager(async sm => {
+    const base = collectionBaseline();
+    await sm.saveSnapshot(base);
+    const before = await fs.readFile(sm.latestFile, 'utf8');
+    const client = collectionClient(base);
+    client.checkStatus = async () => ({ authenticated: true, user: { id: 2, fullname: 'Other synthetic student' } });
+    client.getTimeline = async () => { throw new Error('synthetic unavailable'); };
+    for (const courseId of [null, 10]) {
+      await assert.rejects(async () => sm.saveSnapshot(await sm.buildSnapshot({ client, courseId })), /Unable to fetch the timeline/);
+      assert.equal(await fs.readFile(sm.latestFile, 'utf8'), before);
+    }
+  });
+});
