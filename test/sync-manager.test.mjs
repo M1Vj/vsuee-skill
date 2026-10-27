@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { SyncManager, hashData, expandHome } from '../lib/sync-manager.mjs';
+import { MoodleClient } from '../lib/moodle-client.mjs';
 
 test('hashData generates consistent and deterministic hashes', () => {
   const h1 = hashData({ a: 1, b: 'test' });
@@ -412,6 +413,87 @@ test('SyncManager autoDownloadNewMaterials collects from unhidden and updated it
   // Check consistent directory structure
   assert.match(downloadedUrls[0].targetPath, /1_Topic 1[\/\\]Add1\.pdf/);
   assert.match(downloadedUrls[1].targetPath, /2_Topic 2[\/\\]Unhide1\.pdf/);
+});
+
+test('SyncManager autoDownloadNewMaterials refreshes files revealed and changed together', async (t) => {
+  for (const type of ['resource', 'folder']) {
+    await t.test(type, async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vsuee-refresh-'));
+      try {
+        const sm = new SyncManager({ snapshotsDir: path.join(tmpDir, 'snapshots') });
+        const client = new MoodleClient();
+        const link = 'https://example.invalid/lecture.pdf';
+        const snapshot = (hidden, details) => ({
+          timestamp: '2026-09-01T00:00:00Z',
+          courses: [{
+            id: 100,
+            fullname: 'Test Course',
+            sections: [{
+              number: 1,
+              name: 'Topic',
+              activities: [{ id: 10, type, name: 'Lecture.pdf', link, hidden, details }],
+            }],
+          }],
+          assignments: [],
+        });
+        const diff = sm.diffSnapshots(snapshot(true, 'Original lecture'), snapshot(false, 'Revised lecture'));
+        assert.equal(diff.changes.modulesUnhidden.length, 1);
+        assert.equal(diff.changes.modulesUpdated.length, 1);
+
+        const targetPath = path.join(tmpDir, 'Test Course', '1_Topic', 'Lecture.pdf');
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, 'old lecture');
+
+        let requests = 0;
+        client.fetchWithAuth = async (url) => {
+          assert.equal(url, link);
+          requests++;
+          return new Response('new lecture', {
+            headers: { 'content-type': 'application/pdf', 'content-length': '11' },
+          });
+        };
+
+        const result = await sm.autoDownloadNewMaterials(client, diff, tmpDir);
+        assert.equal(requests, 1, 'overlapping change categories must still download once');
+        assert.equal(await fs.readFile(targetPath, 'utf8'), 'new lecture');
+        assert.equal(result.downloaded, 1);
+        assert.equal(result.files.length, 1);
+        assert.equal(result.files[0].isUpdate, true);
+        assert.equal(result.files[0].skipped, false);
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('SyncManager autoDownloadNewMaterials preserves force and deduplication semantics', async (t) => {
+  const item = {
+    id: 10, type: 'resource', name: 'Lecture.pdf',
+    link: 'https://example.invalid/lecture.pdf',
+    courseName: 'Test Course', sectionNumber: 1, sectionName: 'Topic',
+  };
+  for (const [label, changes, options, expectedUpdate, expectedForce] of [
+    ['added and updated', { modulesAdded: [item], modulesUpdated: [{ ...item, changes: ['Link updated'] }] }, {}, true, true],
+    ['repeated updates', { modulesUpdated: [{ ...item, changes: ['Link updated'] }, { ...item, changes: ['Renamed: Lecture'] }] }, {}, true, true],
+    ['reveal without file update', { modulesUnhidden: [item], modulesUpdated: [{ ...item, changes: ['Completion status: Completed'] }] }, {}, false, false],
+    ['explicit force', { modulesUnhidden: [item] }, { force: true }, false, true],
+  ]) {
+    await t.test(label, async () => {
+      const calls = [];
+      const client = {
+        downloadResource: async (url, targetPath, downloadOptions) => {
+          calls.push({ url, force: downloadOptions.force });
+          return { savedPath: targetPath, size: 11, skipped: false };
+        },
+      };
+      const sm = new SyncManager();
+      const result = await sm.autoDownloadNewMaterials(client, { hasChanges: true, changes }, os.tmpdir(), options);
+      assert.deepEqual(calls, [{ url: item.link, force: expectedForce }]);
+      assert.equal(result.files.length, 1);
+      assert.equal(result.files[0].isUpdate, expectedUpdate);
+    });
+  }
 });
 
 test('SyncManager diff: detects sections reordered via persistent section database IDs', () => {
