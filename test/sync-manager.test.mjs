@@ -775,3 +775,144 @@ test('failed collection fetch does not relabel an existing snapshot under anothe
     }
   });
 });
+
+// Timeline absence describes the fetched result, not portal cancellation.
+const timelineEvent = (id, courseid = 100) => ({ id, courseid, name: `Event ${id}`, coursename: `Course ${courseid}`, timestart: 100, formattedtime: 'Soon', actionurl: `https://example.invalid/event/${id}` });
+const timelineSnapshot = (timeline) => ({ timestamp: '2026-10-30T00:00:00Z', courses: [], assignments: [], timeline });
+
+test('timeline disappearance alone is a counted change with non-cancellation wording', () => {
+  const sm = new SyncManager();
+  const old = timelineSnapshot([timelineEvent(1)]), fresh = timelineSnapshot([]);
+  const original = JSON.stringify(old);
+  const diff = sm.diffSnapshots(old, fresh);
+  assert.equal(diff.hasChanges, true);
+  assert.equal(diff.totalChangeCount, 1);
+  assert.deepEqual(diff.changes.timelineRemoved.map(t => t.id), [1]);
+  const report = sm.formatDiffReport(diff);
+  assert.match(report, /NO LONGER IN THE FETCHED TIMELINE/);
+  assert.match(report, /does not confirm cancellation/);
+  assert.match(report, /Event 1/);
+  assert.equal(JSON.stringify(old), original);
+});
+
+test('timeline removal filtering mirrors additions and includes global events', () => {
+  const sm = new SyncManager();
+  const old = timelineSnapshot([timelineEvent(1, 100), timelineEvent(2, 200), timelineEvent(3, null)]);
+  assert.deepEqual(sm.diffSnapshots(old, timelineSnapshot([]), { courseId: '100' }).changes.timelineRemoved.map(t => t.id), [1, 3]);
+  assert.equal(sm.diffSnapshots(timelineSnapshot([timelineEvent(2, 200)]), timelineSnapshot([]), { courseId: 100 }).hasChanges, false);
+});
+
+test('timeline retained, moved, and added events are not removals', () => {
+  const sm = new SyncManager();
+  const old = timelineSnapshot([timelineEvent(1), timelineEvent(2)]);
+  const diff = sm.diffSnapshots(old, timelineSnapshot([timelineEvent(1), {...timelineEvent(2), timestart: 200}, timelineEvent(3)]));
+  assert.deepEqual(diff.changes.timelineRemoved, []);
+  assert.equal(diff.changes.timelineChanged.length, 1);
+  assert.equal(diff.changes.timelineAdded.length, 1);
+  assert.equal(diff.totalChangeCount, 2);
+});
+
+test('timeline empty, missing, initial and duplicate identities remain compatible', () => {
+  const sm = new SyncManager();
+  assert.deepEqual(sm.diffSnapshots(null, timelineSnapshot([])).changes.timelineRemoved, []);
+  assert.equal(sm.diffSnapshots({courses:[], assignments:[]}, timelineSnapshot([])).hasChanges, false);
+  assert.equal(sm.diffSnapshots(timelineSnapshot([timelineEvent(1), timelineEvent(1)]), timelineSnapshot([])).changes.timelineRemoved.length, 1);
+  const withoutTime = timelineSnapshot([{id: 1, name: 'Untimed'}]);
+  assert.match(sm.formatDiffReport(sm.diffSnapshots(withoutTime, timelineSnapshot([]))), /Untimed/);
+});
+
+for (const command of ['sync', 'watch']) {
+  for (const failing of [false, true]) {
+    test(`${command} real CLI ${failing ? 'preserves on failed fetch' : 'persists timeline-only disappearance and does not repeat'}`, async () => {
+      const { spawnSync } = await import('node:child_process');
+      const { fileURLToPath } = await import('node:url');
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), 'vsuee-timeline-cli-'));
+      try {
+        const dir = path.join(home, '.config', 'vsuee', 'snapshots');
+        const sm = new SyncManager({snapshotsDir: dir});
+        await sm.saveSnapshot(timelineSnapshot([timelineEvent(1)]));
+        const before = await fs.readFile(sm.latestFile);
+        const preload = path.join(home, 'offline.mjs');
+        const clientUrl = new URL('../lib/moodle-client.mjs', import.meta.url).href;
+        await fs.writeFile(preload, `import { MoodleClient } from ${JSON.stringify(clientUrl)};\nglobalThis.fetch = async () => { throw new Error('network forbidden'); };\nMoodleClient.prototype.init = async function() {};\nMoodleClient.prototype.checkStatus = async function() { return { authenticated: true }; };\nMoodleClient.prototype.ensureAuthenticated = async function() {};\nMoodleClient.prototype.getCourses = async function() { return []; };\nMoodleClient.prototype.getAssignments = async function() { return []; };\nMoodleClient.prototype.getTimeline = async function() { ${failing ? "throw new Error('synthetic unavailable');" : 'return [];'} };\n`);
+        const cli = fileURLToPath(new URL('../bin/vsuee.mjs', import.meta.url));
+        const cliArgs = [command, ...(command === 'watch' ? ['--once', '--no-notify'] : ['--json'])];
+        const { pathToFileURL } = await import('node:url');
+        const args = ['--input-type=module', '--eval', `await import(${JSON.stringify(pathToFileURL(preload).href)}); process.argv = [process.execPath, ${JSON.stringify(cli)}, ...${JSON.stringify(cliArgs)}]; await import(${JSON.stringify(pathToFileURL(cli).href)});`];
+        const run = () => spawnSync(process.execPath, args, {env: {...process.env, HOME: home, USERPROFILE: home, VSUEE_SKIP_LIVE:'1'}, encoding:'utf8', timeout:10000});
+        const first = run();
+        assert.equal(first.error, undefined);
+        if (failing) {
+          assert.match(first.stdout + first.stderr, /Unable to fetch the timeline/);
+          assert.deepEqual(await fs.readFile(sm.latestFile), before);
+          return;
+        }
+        assert.equal(first.status, 0, first.stderr);
+        assert.deepEqual((await sm.getLatestSnapshot()).timeline, []);
+        assert.deepEqual((await sm.getPreviousSnapshot()).timeline.map(t=>t.id), [1]);
+        const persisted = await fs.readFile(sm.latestFile);
+        const second = run();
+        assert.equal(second.status, 0, second.stderr);
+        assert.deepEqual(await fs.readFile(sm.latestFile), persisted);
+        if (command === 'sync') assert.equal(JSON.parse(second.stdout).hasChanges, false);
+        else assert.match(second.stdout, /No new updates/);
+      } finally { await fs.rm(home, {recursive:true, force:true}); }
+    });
+  }
+}
+const manager = new SyncManager();
+const event = {
+  id: 101, name: 'Quiz window', coursename: 'Synthetic course', courseid: 42,
+  timestart: 1792922400, formattedtime: 'Tomorrow, 10:00',
+  actionurl: 'https://example.invalid/mod/quiz/view.php?id=101',
+};
+const snapshot = timeline => ({ timestamp: '2026-10-25T09:00:00Z', courses: [], assignments: [], timeline });
+
+for (const context of ['sync', 'diff', 'watch']) {
+  test(`timeline-only reschedule is actionable in ${context} report`, () => {
+    const diff = manager.diffSnapshots(snapshot([event]), snapshot([{ ...event,
+      timestart: 1792915200, formattedtime: 'Tomorrow, 08:00',
+    }]));
+    assert.equal(diff.totalChangeCount, 1);
+    assert.equal(diff.hasChanges, true);
+    const report = manager.formatDiffReport(diff, { context });
+    assert.match(report, /Quiz window \[Synthetic course\]/);
+    assert.match(report, /WAS: Tomorrow, 10:00/);
+    assert.match(report, /NOW: Tomorrow, 08:00/);
+    assert.ok(report.includes(event.actionurl));
+  });
+}
+
+test('timeline reschedule report supports timestamp fallback and missing optional metadata', () => {
+  const oldEvent = { id: 102, name: 'Calendar event', timestart: 1000 };
+  const diff = manager.diffSnapshots(snapshot([oldEvent]), snapshot([{ ...oldEvent, timestart: 2000 }]));
+  const report = manager.formatDiffReport(diff);
+  assert.match(report, /Calendar event/);
+  assert.match(report, /WAS: 1000/);
+  assert.match(report, /NOW: 2000/);
+  assert.doesNotMatch(report, /undefined|URL:/);
+});
+
+test('unchanged timeline does not emit reschedule section', () => {
+  const diff = manager.diffSnapshots(snapshot([event]), snapshot([{ ...event }]));
+  assert.equal(diff.hasChanges, false);
+  assert.doesNotMatch(manager.formatDiffReport(diff), /CALENDAR EVENT.*CHANGES/);
+});
+
+test('legacy diff objects without timelineChanged still format', () => {
+  const diff = manager.diffSnapshots(snapshot([]), snapshot([event]));
+  delete diff.changes.timelineChanged;
+  assert.match(manager.formatDiffReport(diff), /Quiz window/);
+});
+
+for (const missingTime of [null, undefined]) {
+  test(`timeline report labels ${missingTime} times as unknown`, () => {
+    const diff = manager.diffSnapshots(snapshot([event]), snapshot([{ ...event, timestart: 0, formattedtime: missingTime }]));
+    diff.changes.timelineChanged[0].oldTime = missingTime;
+    const report = manager.formatDiffReport(diff);
+    assert.match(report, /WAS: Unknown/);
+    assert.match(report, /NOW: 0/);
+    assert.doesNotMatch(report, /WAS: null|WAS: undefined/);
+  });
+}
+
