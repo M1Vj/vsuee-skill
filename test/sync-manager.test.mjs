@@ -916,3 +916,62 @@ for (const missingTime of [null, undefined]) {
   });
 }
 
+
+
+const loginPages = [
+  '<form action="/login/index.php"><input name="logintoken" value="synthetic"></form>',
+  '<a href="/login/index.php">Login</a><p>You are not logged in</p>',
+];
+const courseHtml = name => `<h1>Synthetic course</h1><li id="section-0" class="section"><h3 class="sectionname"><span>General</span></h3><li class="activity resource modtype_resource" id="module-101"><a class="aalink" href="https://example.invalid/resource"><span class="instancename">${name}</span></a></li></li>`;
+
+for (const [index, html] of loginPages.entries()) {
+  test(`course contents reject logged-out HTML marker ${index}`, async () => {
+    const client = new MoodleClient({baseUrl:'https://example.invalid'});
+    client.fetchWithAuth = async () => new Response(html,{status:200});
+    await assert.rejects(client.getCourseContents(10), {message:'Session expired while fetching snapshot data.'});
+  });
+
+  for (const courseId of [null,10]) {
+    test(`snapshot preserves course after login page ${index}, scoped=${Boolean(courseId)}, then recovers`, async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(),'vsuee-course-guard-'));
+      try {
+        const sm = new SyncManager({snapshotsDir:dir});
+        const client = new MoodleClient({baseUrl:'https://example.invalid'});
+        client.checkStatus = async () => ({authenticated:true,user:{id:'synthetic'}});
+        client.getCourses = async () => [{id:10,fullname:'Synthetic course'}];
+        client.getAssignments = async () => [];
+        client.getTimeline = async () => [];
+        let responseHtml = courseHtml('Original material');
+        client.fetchWithAuth = async () => new Response(responseHtml,{status:200});
+        const base = await sm.buildSnapshot({client,courseId});
+        assert.equal(base.courses[0].sections[0].activities[0].name,'Original material');
+        await sm.saveSnapshot(base);
+        const baseBytes = await fs.readFile(sm.latestFile,'utf8');
+        responseHtml = html;
+        const failed = await sm.buildSnapshot({client,courseId});
+        assert.equal(await fs.readFile(sm.latestFile,'utf8'),baseBytes);
+        assert.equal(failed.courses[0].stale,true);
+        assert.equal(failed.courses[0].fetchError,'Session expired while fetching snapshot data.');
+        assert.deepEqual(failed.courses[0].sections,base.courses[0].sections);
+        const diff = sm.diffSnapshots(base,failed);
+        assert.deepEqual(diff.changes.sectionsRemoved,[]);
+        assert.deepEqual(diff.changes.modulesRemoved,[]);
+        await sm.saveSnapshot(failed);
+        responseHtml = courseHtml('Updated material');
+        const recovered = await sm.buildSnapshot({client,courseId});
+        assert.equal(recovered.courses[0].stale,undefined);
+        assert.equal(recovered.courses[0].fetchError,undefined);
+        assert.equal(recovered.courses[0].sections[0].activities[0].name,'Updated material');
+        assert.equal(sm.diffSnapshots(failed,recovered).changes.modulesUpdated.length,1);
+      } finally { await fs.rm(dir,{recursive:true,force:true}); }
+    });
+  }
+}
+
+test('genuinely empty successful course stays empty and HTTP failures still reject', async () => {
+  const client = new MoodleClient({baseUrl:'https://example.invalid'});
+  client.fetchWithAuth = async () => new Response('<h1>Empty course</h1>',{status:200});
+  assert.deepEqual((await client.getCourseContents(10)).sections,[]);
+  client.fetchWithAuth = async () => new Response('Unavailable',{status:503});
+  await assert.rejects(client.getCourseContents(10),/HTTP 503/);
+});
