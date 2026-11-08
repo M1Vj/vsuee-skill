@@ -108,3 +108,62 @@ test('BrowserRunner captureScreenshot takes screenshots with selector, section, 
     try { await fs.unlink(tmpOut); } catch {}
   }
 });
+
+// Offline lifecycle doubles: no Playwright process, portal, or real session is used.
+function interactiveSessionFixture(failAt, { closeFails = false, sessionCookie = null } = {}) {
+  const setupError = new Error(`synthetic ${failAt} failure`);
+  let closeCount = 0;
+  const calls = [];
+  const step = async (name, result) => {
+    calls.push(name);
+    if (failAt === name) throw setupError;
+    return result;
+  };
+  const page = { goto: async (...args) => step('goto', args) };
+  const context = {
+    addCookies: async () => step('addCookies'),
+    newPage: async () => step('newPage', page),
+  };
+  const browser = {
+    newContext: async () => step('newContext', context),
+    close: async () => {
+      closeCount++;
+      if (closeFails) throw new Error('synthetic cleanup failure');
+    },
+  };
+  const runner = new BrowserRunner({ sessionCookie });
+  runner.getPlaywright = async () => ({ launch: async () => step('launch', browser) });
+  return { runner, browser, context, page, setupError, calls, closeCount: () => closeCount };
+}
+
+for (const stage of ['newContext', 'addCookies', 'newPage', 'goto']) {
+  test(`openInteractiveSession closes browser after ${stage} failure`, async () => {
+    const fixture = interactiveSessionFixture(stage, { sessionCookie: 'synthetic-test-cookie' });
+    await assert.rejects(fixture.runner.openInteractiveSession(), (err) => err === fixture.setupError);
+    assert.equal(fixture.closeCount(), 1);
+    assert.equal(fixture.calls.at(-1), stage, 'setup must stop at the failing stage');
+  });
+}
+
+test('openInteractiveSession preserves setup error when cleanup also fails', async () => {
+  const fixture = interactiveSessionFixture('goto', { closeFails: true });
+  await assert.rejects(fixture.runner.openInteractiveSession(), (err) => err === fixture.setupError);
+  assert.equal(fixture.closeCount(), 1);
+});
+
+test('openInteractiveSession leaves successful browser open for its caller', async () => {
+  const fixture = interactiveSessionFixture(null);
+  assert.deepEqual(await fixture.runner.openInteractiveSession(), {
+    browser: fixture.browser, context: fixture.context, page: fixture.page,
+  });
+  assert.equal(fixture.closeCount(), 0);
+  assert.deepEqual(fixture.calls, ['launch', 'newContext', 'newPage', 'goto']);
+  await fixture.browser.close();
+  assert.equal(fixture.closeCount(), 1);
+});
+
+test('openInteractiveSession preserves launch failure without closing a nonexistent browser', async () => {
+  const fixture = interactiveSessionFixture('launch');
+  await assert.rejects(fixture.runner.openInteractiveSession(), (err) => err === fixture.setupError);
+  assert.equal(fixture.closeCount(), 0);
+});
