@@ -609,6 +609,60 @@ test('generateIcsCalendar includes RFC 5545 VALARM reminders and action URLs', (
   assert.ok(ics.includes('LOCATION:CS 200a - Internship/OJT'));
 });
 
+test('generateIcsCalendar derives the default end from each supported start representation', async (t) => {
+  const starts = [
+    ['Date object', new Date('2026-09-07T04:00:00.000Z')],
+    ['ISO string', '2026-09-07T04:00:00.000Z'],
+    ['offset ISO string', '2026-09-07T12:00:00+08:00'],
+    ['Unix seconds', 1788753600],
+    ['Unix seconds string', '1788753600'],
+    ['Unix milliseconds', 1788753600000],
+    ['compact UTC string', '20260907T040000Z'],
+    ['compact string without Z', '20260907T040000'],
+    ['padded compact string', ' 20260907T040000Z '],
+  ];
+
+  for (const [label, start] of starts) {
+    for (const field of ['dtstart', 'timestart']) {
+      await t.test(`${label} via ${field}`, () => {
+        const ics = generateIcsCalendar([{ id: 1, [field]: start }]);
+        assert.ok(ics.includes('DTSTART:20260907T040000Z\r\n'));
+        assert.ok(ics.includes('DTEND:20260907T050000Z\r\n'));
+      });
+    }
+  }
+});
+
+test('generateIcsCalendar keeps default ends one hour after starts across UTC date boundaries', () => {
+  for (const [start, end] of [
+    ['20261231T233000Z', '20270101T003000Z'],
+    ['20280228T233000Z', '20280229T003000Z'],
+    ['20280229T233000Z', '20280301T003000Z'],
+  ]) {
+    const ics = generateIcsCalendar([{ id: 1, dtstart: start }]);
+    assert.ok(ics.includes(`DTEND:${end}\r\n`));
+  }
+});
+
+test('generateIcsCalendar preserves explicit end values and field precedence', () => {
+  const ics = generateIcsCalendar([{
+    id: 1,
+    dtstart: '20260907T040000Z',
+    timestart: '20260908T040000Z',
+    dtend: '20260907T043000Z',
+    timeend: '20260907T060000Z',
+  }]);
+  assert.ok(ics.includes('DTSTART:20260907T040000Z\r\n'));
+  assert.ok(ics.includes('DTEND:20260907T043000Z\r\n'));
+
+  const timeEnd = generateIcsCalendar([{
+    id: 2,
+    timestart: 1788753600,
+    timeend: 1788760800,
+  }]);
+  assert.ok(timeEnd.includes('DTEND:20260907T060000Z\r\n'));
+});
+
 test('getAssignmentDetails extracts Moodle 4+ activity-dates, full main attachments, and cleaned comments', async () => {
   const client = new MoodleClient();
   const mockMoodle4Html = `
